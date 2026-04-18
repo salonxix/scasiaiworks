@@ -1,0 +1,717 @@
+﻿import { Groq } from 'groq-sdk';
+import { LLMTaskType, ModelConfig, GenerationOptions, GenerationResult, EmbedOptions, EmbedResult } from './types';
+import { taskPolicies } from './policy';
+import { rateLimiter } from './rate-limiter';
+import { llmCache } from './cache';
+import { traceLLMCall } from './tracing';
+
+/** Must match the vector(768) column in Supabase and hybridSearch.ts. */
+const EMBED_DIM = 768;
+
+/** Create an AbortError that works across runtimes.
+ *  DOMException('Aborted', 'AbortError') requires Node 17+ / browser.
+ *  On older runtimes, fall back to a plain Error with .name = 'AbortError'.
+ *
+ *  Exported so other modules (e.g. hybridSearch) can create consistent abort errors
+ *  without depending on DOMException directly. */
+export function createAbortError(message: string = 'Aborted'): Error {
+    if (typeof DOMException !== 'undefined') {
+        return new DOMException(message, 'AbortError');
+    }
+    const err = new Error(message);
+    err.name = 'AbortError';
+    return err;
+}
+
+export class LLMRouter {
+    private groqClients = new Map<string, Groq>();
+    // Store the init Promise (not the resolved pipeline) to avoid a race condition
+    // where concurrent callers each trigger a separate download + instantiation.
+    private localEmbedderPromise: Promise<any> | null = null;
+
+    private getGroqClient(apiKeyEnv: string): Groq {
+        let client = this.groqClients.get(apiKeyEnv);
+        if (!client) {
+            client = new Groq({ apiKey: process.env[apiKeyEnv] || '' });
+            this.groqClients.set(apiKeyEnv, client);
+        }
+        return client;
+    }
+
+    private getApiKey(model: ModelConfig): string {
+        return process.env[model.apiKeyEnv] || '';
+    }
+
+    private isModelConfigured(model: ModelConfig): boolean {
+        if (model.provider === 'local') return true; // local never needs a key
+        if (model.apiKeyEnv === 'NONE') return true;
+        const key = process.env[model.apiKeyEnv] || '';
+        return !!(key && !key.startsWith('your_'));
+    }
+
+    private getModelFromChain(task: LLMTaskType, attempt: number): ModelConfig {
+        const policy = taskPolicies[task];
+        if (attempt === 0) return policy.primary;
+
+        const fallbackIndex = attempt - 1;
+        if (fallbackIndex < policy.fallbackChain.length) {
+            return policy.fallbackChain[fallbackIndex];
+        }
+
+        return policy.fallbackChain[policy.fallbackChain.length - 1] || policy.primary;
+    }
+
+    private parseJsonResponse(text: string): string {
+        // 1. Strip thinking tags (Qwen, DeepSeek, etc.)
+        let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+
+        // 2. Try markdown code block extraction
+        const mdMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+        if (mdMatch) {
+            cleaned = mdMatch[1].trim();
+        }
+
+        // 3. If it already looks like valid JSON, return as-is
+        if (/^\s*[{\[]/.test(cleaned) && /[}\]]\s*$/.test(cleaned)) {
+            return cleaned;
+        }
+
+        // 4. Find the first JSON object {...} in the text
+        const objStart = cleaned.indexOf('{');
+        const objEnd = cleaned.lastIndexOf('}');
+        if (objStart !== -1 && objEnd > objStart) {
+            return cleaned.slice(objStart, objEnd + 1);
+        }
+
+        // 5. Find the first JSON array [...] in the text
+        const arrStart = cleaned.indexOf('[');
+        const arrEnd = cleaned.lastIndexOf(']');
+        if (arrStart !== -1 && arrEnd > arrStart) {
+            return cleaned.slice(arrStart, arrEnd + 1);
+        }
+
+        return cleaned;
+    }
+
+    async generateText<T = string>(
+        task: LLMTaskType,
+        prompt: string,
+        options: GenerationOptions<T> = {}
+    ): Promise<GenerationResult<T>> {
+        const { schema, traceId, cacheKey, retries = 3 } = options;
+
+        // Short-circuit: if the caller already aborted, don't start any work
+        if (options.signal?.aborted) {
+            throw createAbortError('Aborted');
+        }
+
+        if (cacheKey) {
+            const cached = await llmCache.get<GenerationResult<T>>(`gen:${cacheKey}`);
+            if (cached) {
+                traceLLMCall(traceId, 'generateText', 'cache-hit', Date.now(), cached);
+                return cached;
+            }
+        }
+
+        let attempt = 0;
+        while (attempt < (taskPolicies[task].fallbackChain.length + 1)) {
+            const model = this.getModelFromChain(task, attempt);
+
+            // Skip models whose API key is not configured
+            if (!this.isModelConfigured(model)) {
+                console.warn(`[LLMRouter] Skipping ${model.id} — ${model.apiKeyEnv} not configured`);
+                attempt++;
+                continue;
+            }
+
+            let repairAttempt = 0;
+            const currentPrompt = prompt;
+            let errorContext = '';
+
+            while (repairAttempt < retries) {
+                let fullPrompt = currentPrompt;
+                if (schema && repairAttempt > 0) {
+                    fullPrompt += `\n\nYour previous response failed validation with error: ${errorContext}. Please fix the JSON and return ONLY valid JSON.`;
+                }
+
+                const startTime = Date.now();
+                try {
+                    const estTokens = (fullPrompt.length / 4) + (options.maxTokens || 1000);
+                    await rateLimiter.acquire(model.apiKeyEnv, estTokens);
+
+                    let resultText = '';
+                    let usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+                    if (model.provider === 'groq') {
+                        const groq = this.getGroqClient(model.apiKeyEnv);
+                        const resp = await groq.chat.completions.create({
+                            model: model.id,
+                            messages: [
+                                ...(options.systemPrompt ? [{ role: 'system' as const, content: options.systemPrompt }] : []),
+                                { role: 'user' as const, content: fullPrompt }
+                            ],
+                            temperature: options.temperature ?? 0.7,
+                            max_tokens: options.maxTokens,
+                            response_format: schema ? { type: 'json_object' } : undefined
+                        }, { signal: options.signal });
+
+                        resultText = resp.choices[0]?.message?.content || '';
+                        const rawUsage = resp.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+                        usage = {
+                            promptTokens: rawUsage.prompt_tokens,
+                            completionTokens: rawUsage.completion_tokens,
+                            totalTokens: rawUsage.total_tokens
+                        };
+                    } else if (model.provider === 'openrouter') {
+                        const apiKey = this.getApiKey(model);
+                        const body: Record<string, unknown> = {
+                            model: model.id,
+                            messages: [
+                                ...(options.systemPrompt ? [{ role: 'system', content: options.systemPrompt }] : []),
+                                { role: 'user', content: fullPrompt }
+                            ],
+                            temperature: options.temperature ?? 0.7,
+                            max_tokens: options.maxTokens,
+                        };
+
+                        const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${apiKey}`,
+                                'HTTP-Referer': process.env.NEXTAUTH_URL || 'http://localhost:3000',
+                                'X-Title': 'Scasi-AI'
+                            },
+                            body: JSON.stringify(body),
+                            signal: options.signal,
+                        });
+
+                        if (!resp.ok) {
+                            const errBody = await resp.text();
+                            throw new Error(`OpenRouter Error: ${resp.status} ${errBody}`);
+                        }
+
+                        const data = await resp.json();
+                        resultText = data.choices[0]?.message?.content || '';
+                        const rawUsage = data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+                        usage = {
+                            promptTokens: rawUsage.prompt_tokens,
+                            completionTokens: rawUsage.completion_tokens,
+                            totalTokens: rawUsage.total_tokens
+                        };
+                    } else if (model.provider === 'sarvam') {
+                        const apiKey = this.getApiKey(model);
+                        const body: Record<string, unknown> = {
+                            model: model.id,
+                            messages: [
+                                ...(options.systemPrompt ? [{ role: 'system', content: options.systemPrompt }] : []),
+                                { role: 'user', content: fullPrompt }
+                            ],
+                            temperature: options.temperature ?? 0.7,
+                            max_tokens: options.maxTokens,
+                        };
+
+                        const resp = await fetch('https://api.sarvam.ai/v1/chat/completions', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'api-subscription-key': apiKey,
+                            },
+                            body: JSON.stringify(body),
+                            signal: options.signal,
+                        });
+
+                        if (!resp.ok) {
+                            const errBody = await resp.text();
+                            throw new Error(`Sarvam Error: ${resp.status} ${errBody}`);
+                        }
+
+                        const data = await resp.json();
+                        resultText = data.choices[0]?.message?.content || '';
+                        const rawUsage = data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+                        usage = {
+                            promptTokens: rawUsage.prompt_tokens,
+                            completionTokens: rawUsage.completion_tokens,
+                            totalTokens: rawUsage.total_tokens
+                        };
+                    }
+
+                    rateLimiter.recordActualTokens(model.apiKeyEnv, usage.totalTokens, estTokens);
+
+                    if (schema) {
+                        const jsonString = this.parseJsonResponse(resultText);
+                        try {
+                            const parsedInput = JSON.parse(jsonString);
+                            const validatedData = schema.parse(parsedInput);
+
+                            const finalResult: GenerationResult<T> = { data: validatedData, usage, model: model.id };
+                            traceLLMCall(traceId, 'generateText', model.id, startTime, finalResult as GenerationResult);
+
+                            if (cacheKey) await llmCache.set(`gen:${cacheKey}`, finalResult);
+                            return finalResult;
+                        } catch (err: unknown) {
+                            errorContext = err instanceof Error ? err.message : String(err);
+                            repairAttempt++;
+                            console.warn(`[LLMRouter] Schema validation failed on ${model.id} (attempt ${repairAttempt}/${retries}). Raw response: ${resultText.slice(0, 300)}`);
+                            console.warn(`[LLMRouter] Parsed JSON string: ${jsonString.slice(0, 300)}`);
+                            console.warn(`[LLMRouter] Error: ${errorContext}`);
+                            continue;
+                        }
+                    }
+
+                    const finalResult: GenerationResult<T> = { text: resultText, usage, model: model.id };
+                    traceLLMCall(traceId, 'generateText', model.id, startTime, finalResult as GenerationResult);
+
+                    if (cacheKey) await llmCache.set(`gen:${cacheKey}`, finalResult);
+                    return finalResult;
+
+                } catch (err: unknown) {
+                    // Rethrow AbortError immediately â€” don't waste time trying fallback models.
+                    // Use err.name check instead of instanceof DOMException to avoid
+                    // ReferenceError on runtimes where DOMException is not defined.
+                    if (err instanceof Error && err.name === 'AbortError') {
+                        traceLLMCall(traceId, 'generateText', model.id, startTime, undefined, err);
+                        throw err;
+                    }
+                    const errMsg = err instanceof Error ? err.message : String(err);
+                    console.error(`[LLMRouter] API call failed on ${model.id} for task ${task}: ${errMsg}`);
+                    traceLLMCall(traceId, 'generateText', model.id, startTime, undefined, err);
+                    break;
+                }
+            }
+
+            attempt++;
+        }
+
+        console.error(`[LLMRouter] All models exhausted for task: ${task}`);
+        throw new Error(`All models failed for task: ${task}.`);
+    }
+
+    async *streamText(
+        task: LLMTaskType,
+        prompt: string,
+        options: GenerationOptions = {}
+    ): AsyncIterable<string> {
+        // Short-circuit: if the caller already aborted, don't start any work
+        if (options.signal?.aborted) {
+            throw createAbortError('Aborted');
+        }
+
+        const policy = taskPolicies[task];
+        const modelChain = [policy.primary, ...policy.fallbackChain];
+        const estPromptTokens = Math.ceil(
+            (prompt.length + (options.systemPrompt?.length || 0)) / 4
+        );
+
+        for (let attempt = 0; attempt < modelChain.length; attempt++) {
+            const model = modelChain[attempt];
+
+            // Skip models whose API key is not configured
+            if (!this.isModelConfigured(model)) {
+                console.warn(`[LLMRouter] streamText skipping ${model.id} — ${model.apiKeyEnv} not configured`);
+                continue;
+            }
+            const startTime = Date.now();
+            let collectedText = '';
+            let lastError: unknown;
+
+            try {
+                // Check abort before each stream attempt
+                if (options.signal?.aborted) throw createAbortError('Aborted');
+                yield* this.streamFromModel(model, prompt, options, (text) => { collectedText += text; });
+                // Success â€” trace and return
+                const estCompletionTokens = Math.ceil(collectedText.length / 4);
+                traceLLMCall(options.traceId, 'streamText', model.id, startTime, {
+                    text: collectedText,
+                    usage: { promptTokens: estPromptTokens, completionTokens: estCompletionTokens, totalTokens: estPromptTokens + estCompletionTokens },
+                    model: model.id,
+                });
+                return;
+            } catch (err) {
+                lastError = err;
+                // Rethrow AbortError immediately â€” don't try fallback models
+                if (err instanceof Error && err.name === 'AbortError') {
+                    traceLLMCall(options.traceId, 'streamText', model.id, startTime, undefined, err);
+                    throw err;
+                }
+                const errMsg = err instanceof Error ? err.message : String(err);
+                console.warn(`[LLMRouter] streamText failed on ${model.id} (attempt ${attempt + 1}/${modelChain.length}): ${errMsg}`);
+                traceLLMCall(options.traceId, 'streamText', model.id, startTime, undefined, lastError);
+
+                if (attempt < modelChain.length - 1) {
+                    console.warn(`[LLMRouter] streamText falling back to ${modelChain[attempt + 1].id}`);
+                    continue;
+                }
+                throw new Error(`All models failed for streamText task: ${task}. Last error: ${errMsg}`);
+            }
+        }
+    }
+
+    private async *streamFromModel(
+        model: ModelConfig,
+        prompt: string,
+        options: GenerationOptions,
+        onToken: (text: string) => void
+    ): AsyncIterable<string> {
+        const signal = options.signal;
+
+        if (model.provider === 'groq') {
+            const groq = this.getGroqClient(model.apiKeyEnv);
+            const stream = await groq.chat.completions.create({
+                model: model.id,
+                messages: [
+                    ...(options.systemPrompt ? [{ role: 'system' as const, content: options.systemPrompt }] : []),
+                    { role: 'user' as const, content: prompt }
+                ],
+                temperature: options.temperature ?? 0.7,
+                max_tokens: options.maxTokens,
+                stream: true
+            }, { signal });
+
+            for await (const chunk of stream) {
+                if (signal?.aborted) {
+                    throw createAbortError('Aborted during Groq stream');
+                }
+                const text = chunk.choices[0]?.delta?.content || '';
+                if (text) { onToken(text); yield text; }
+            }
+
+        } else if (model.provider === 'openrouter') {
+            const apiKey = this.getApiKey(model);
+            const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': process.env.NEXTAUTH_URL || 'http://localhost:3000',
+                    'X-Title': 'Scasi-AI'
+                },
+                body: JSON.stringify({
+                    model: model.id,
+                    messages: [
+                        ...(options.systemPrompt ? [{ role: 'system', content: options.systemPrompt }] : []),
+                        { role: 'user', content: prompt }
+                    ],
+                    temperature: options.temperature ?? 0.7,
+                    max_tokens: options.maxTokens,
+                    stream: true
+                }),
+                signal,
+            });
+
+            if (!resp.ok) throw new Error(`OpenRouter Stream Error: ${resp.status}`);
+            if (!resp.body) throw new Error('No body returned from streaming API');
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+
+            while (true) {
+                if (signal?.aborted) {
+                    await reader.cancel().catch(() => {});
+                    throw createAbortError('Aborted during OpenRouter stream');
+                }
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                let boundary = buffer.indexOf('\n');
+
+                while (boundary !== -1) {
+                    const line = buffer.slice(0, boundary).trim();
+                    buffer = buffer.slice(boundary + 1);
+                    boundary = buffer.indexOf('\n');
+
+                    if (line.startsWith('data: ')) {
+                        const dataStr = line.slice(6).trim();
+                        if (dataStr === '[DONE]') return;
+                        try {
+                            const data = JSON.parse(dataStr);
+                            const content = data.choices[0]?.delta?.content || '';
+                            if (content) { onToken(content); yield content; }
+                        } catch {
+                            // Incomplete SSE chunk, skip
+                        }
+                    }
+                }
+            }
+        } else if (model.provider === 'sarvam') {
+            const apiKey = this.getApiKey(model);
+            const resp = await fetch('https://api.sarvam.ai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-subscription-key': apiKey,
+                },
+                body: JSON.stringify({
+                    model: model.id,
+                    messages: [
+                        ...(options.systemPrompt ? [{ role: 'system', content: options.systemPrompt }] : []),
+                        { role: 'user', content: prompt }
+                    ],
+                    temperature: options.temperature ?? 0.7,
+                    max_tokens: options.maxTokens,
+                    stream: true
+                }),
+                signal,
+            });
+
+            if (!resp.ok) throw new Error(`Sarvam Stream Error: ${resp.status}`);
+            if (!resp.body) throw new Error('No body returned from Sarvam streaming API');
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+
+            while (true) {
+                if (signal?.aborted) {
+                    await reader.cancel().catch(() => {});
+                    throw createAbortError('Aborted during Sarvam stream');
+                }
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                let boundary = buffer.indexOf('\n');
+
+                while (boundary !== -1) {
+                    const line = buffer.slice(0, boundary).trim();
+                    buffer = buffer.slice(boundary + 1);
+                    boundary = buffer.indexOf('\n');
+
+                    if (line.startsWith('data: ')) {
+                        const dataStr = line.slice(6).trim();
+                        if (dataStr === '[DONE]') return;
+                        try {
+                            const data = JSON.parse(dataStr);
+                            const content = data.choices[0]?.delta?.content || '';
+                            if (content) { onToken(content); yield content; }
+                        } catch {
+                            // Incomplete SSE chunk, skip
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async embed(texts: string[], options: EmbedOptions = {}): Promise<EmbedResult> {
+        const startTime = Date.now();
+        const { traceId, signal } = options;
+        const model = taskPolicies['embed'].primary;
+
+        // Short-circuit: if the caller already aborted, don't start any work
+        if (signal?.aborted) {
+            throw createAbortError('Aborted');
+        }
+
+        try {
+            if (model.provider === 'local') {
+                return await this.embedViaLocal(texts, model, traceId, startTime, signal);
+            }
+            
+            const apiKey = this.getApiKey(model);
+            if (!apiKey) {
+                throw new Error(`${model.apiKeyEnv} not set â€” embeddings disabled, FTS search will be used instead.`);
+            }
+
+            if (model.provider === 'google') {
+                return await this.embedViaGemini(texts, model, apiKey, traceId, startTime, signal);
+            }
+            return await this.embedViaOpenRouter(texts, model, apiKey, traceId, startTime, signal);
+        } catch (err: unknown) {
+            // Rethrow AbortError immediately
+            if (err instanceof Error && err.name === 'AbortError') {
+                traceLLMCall(traceId, 'embed', model.id, startTime, undefined, err);
+                throw err;
+            }
+            traceLLMCall(traceId, 'embed', model.id, startTime, undefined, err);
+            throw err;
+        }
+    }
+
+    /**
+     * Gemini batchEmbedContents API.
+     * Endpoint: POST /v1beta/models/{model}:batchEmbedContents?key={apiKey}
+     * Uses outputDimensionality to produce 768-dim vectors matching the DB schema.
+     */
+    private async embedViaGemini(
+        texts: string[],
+        model: ModelConfig,
+        apiKey: string,
+        traceId: string | undefined,
+        startTime: number,
+        signal?: AbortSignal
+    ): Promise<EmbedResult> {
+        const batchSize = 100; // Gemini batch limit
+        const allEmbeddings: number[][] = [];
+        let totalTokens = 0;
+
+        for (let i = 0; i < texts.length; i += batchSize) {
+            const batchTexts = texts.slice(i, i + batchSize);
+            if (signal?.aborted) throw createAbortError('Aborted');
+
+            const resp = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:batchEmbedContents?key=${apiKey}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        requests: batchTexts.map(text => ({
+                            model: `models/${model.id}`,
+                            content: { parts: [{ text }] },
+                            outputDimensionality: EMBED_DIM,
+                        })),
+                    }),
+                    signal,
+                }
+            );
+
+            if (!resp.ok) {
+                const errText = await resp.text();
+                throw new Error(`Gemini Embed Error: ${resp.status} - ${errText}`);
+            }
+
+            const data = await resp.json();
+            const embeddings = (data.embeddings as Array<{ values: number[] }>).map(e => e.values);
+            allEmbeddings.push(...embeddings);
+
+            // Gemini doesn't return token counts; estimate from char length
+            totalTokens += batchTexts.reduce((sum, t) => sum + Math.ceil(t.length / 4), 0);
+        }
+
+        const result: EmbedResult = {
+            embeddings: allEmbeddings,
+            usage: { promptTokens: totalTokens },
+            model: model.id,
+        };
+
+        traceLLMCall(traceId, 'embed', model.id, startTime, result);
+        return result;
+    }
+
+    /** OpenRouter /v1/embeddings (OpenAI-compatible). Kept as fallback path. */
+    private async embedViaOpenRouter(
+        texts: string[],
+        model: ModelConfig,
+        apiKey: string,
+        traceId: string | undefined,
+        startTime: number,
+        signal?: AbortSignal
+    ): Promise<EmbedResult> {
+        const batchSize = 100;
+        const allEmbeddings: number[][] = [];
+        let totalTokens = 0;
+
+        for (let i = 0; i < texts.length; i += batchSize) {
+            if (signal?.aborted) throw createAbortError('Aborted');
+
+            const batchTexts = texts.slice(i, i + batchSize);
+
+            const resp = await fetch('https://openrouter.ai/api/v1/embeddings', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                    'HTTP-Referer': process.env.NEXTAUTH_URL || 'http://localhost:3000',
+                    'X-Title': 'Scasi-AI',
+                },
+                body: JSON.stringify({
+                    model: model.id,
+                    input: batchTexts,
+                    dimensions: EMBED_DIM,
+                }),
+                signal,
+            });
+
+            if (!resp.ok) {
+                const errText = await resp.text();
+                throw new Error(`OpenRouter Embed Error: ${resp.status} - ${errText}`);
+            }
+
+            const data = await resp.json();
+            const sorted = [...(data.data as Array<{ embedding: number[]; index: number }>)]
+                .sort((a, b) => a.index - b.index);
+            allEmbeddings.push(...sorted.map(d => d.embedding));
+
+            totalTokens += data.usage?.prompt_tokens ?? batchTexts.reduce((sum, t) => sum + Math.ceil(t.length / 4), 0);
+        }
+
+        const result: EmbedResult = {
+            embeddings: allEmbeddings,
+            usage: { promptTokens: totalTokens },
+            model: model.id,
+        };
+
+        traceLLMCall(traceId, 'embed', model.id, startTime, result);
+        return result;
+    }
+
+    /** Local embeddings using Transformers.js (100% Free and Offline) */
+    private async embedViaLocal(
+        texts: string[],
+        model: ModelConfig,
+        traceId: string | undefined,
+        startTime: number,
+        signal?: AbortSignal
+    ): Promise<EmbedResult> {
+        // Store the Promise so concurrent callers all await the same init â€”
+        // avoids multiple redundant downloads and model instantiations.
+        if (!this.localEmbedderPromise) {
+            this.localEmbedderPromise = (async () => {
+                const { pipeline, env } = await import('@xenova/transformers');
+                // Disable local models checking since we'll download from HF hub the first time
+                env.allowLocalModels = false;
+                // Use quantized for highly efficient CPU execution
+                return await pipeline('feature-extraction', model.id, {
+                    quantized: true,
+                });
+            })();
+        }
+        // Await the shared promise, but reset it on rejection so subsequent
+        // calls can retry (avoids sticky rejection after transient failures).
+        let localEmbedder: any;
+        try {
+            localEmbedder = await this.localEmbedderPromise;
+        } catch (err) {
+            this.localEmbedderPromise = null;
+            throw err;
+        }
+        
+        let totalTokens = 0;
+        const allEmbeddings: number[][] = [];
+
+        const batchSize = 100;
+        for (let i = 0; i < texts.length; i += batchSize) {
+             // Check abort between batches â€” local embeddings can't truly abort mid-batch
+             if (signal?.aborted) throw createAbortError('Aborted');
+
+             const batchTexts = texts.slice(i, i + batchSize);
+             
+             const output = await localEmbedder(batchTexts, { pooling: 'mean', normalize: true });
+             
+             // The output tensor is shape [batchSize, dim]
+             const data = output.tolist();
+             
+             if (batchTexts.length === 1 && typeof data[0] === 'number') {
+                 allEmbeddings.push(data as unknown as number[]);
+             } else {
+                 allEmbeddings.push(...(data as unknown as number[][]));
+             }
+             
+             // Estimate tokens based on char length
+             totalTokens += batchTexts.reduce((sum, t) => sum + Math.ceil(t.length / 4), 0);
+        }
+
+        const result: EmbedResult = {
+            embeddings: allEmbeddings,
+            usage: { promptTokens: totalTokens },
+            model: model.id,
+        };
+
+        traceLLMCall(traceId, 'embed', model.id, startTime, result);
+        return result;
+    }
+}
+
+export const llmRouter = new LLMRouter();
