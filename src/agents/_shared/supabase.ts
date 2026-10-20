@@ -17,18 +17,24 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+function isConfigured(): boolean {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    return !!(url && !url.startsWith('your_'));
+}
 
-function requireEnv(name: string): string {
-    const value = process.env[name];
-    if (!value || value.startsWith('your_')) {
-        throw new Error(
-            `[agents/_shared/supabase] Missing or unconfigured environment variable: ${name}. ` +
-            `Add it to .env.local.`
-        );
-    }
-    return value;
+function createNoopClient(): SupabaseClient {
+    const handler: ProxyHandler<any> = {
+        get(_target, prop) {
+            if (prop === 'then') {
+                return (resolve: any) => resolve({ data: null, error: null });
+            }
+            return () => new Proxy(() => {}, handler);
+        },
+        apply() {
+            return new Proxy(() => {}, handler);
+        },
+    };
+    return new Proxy(() => {}, handler) as unknown as SupabaseClient;
 }
 
 // ---------------------------------------------------------------------------
@@ -48,9 +54,10 @@ let _serviceRoleClient: SupabaseClient | null = null;
  * Safe to use in any agent that acts on behalf of a user.
  */
 export function getAnonClient(): SupabaseClient {
+    if (!isConfigured()) return createNoopClient();
     if (!_anonClient) {
-        const url = requireEnv('NEXT_PUBLIC_SUPABASE_URL');
-        const anonKey = requireEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
+        const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+        const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
         _anonClient = createClient(url, anonKey, {
             auth: {
@@ -65,15 +72,15 @@ export function getAnonClient(): SupabaseClient {
 
 /**
  * Returns a Supabase client that uses the **service-role** key.
- * RLS is bypassed — use only for trusted server-side operations
- * (e.g. bulk ingestion, migrations, admin tasks).
- *
- * @throws {Error} if `SUPABASE_SERVICE_ROLE_KEY` is not set
+ * RLS is bypassed — use only for trusted server-side operations.
  */
 export function getServiceRoleClient(): SupabaseClient {
+    if (!isConfigured() || !process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY.startsWith('your_')) {
+        return createNoopClient();
+    }
     if (!_serviceRoleClient) {
-        const url = requireEnv('NEXT_PUBLIC_SUPABASE_URL');
-        const serviceKey = requireEnv('SUPABASE_SERVICE_ROLE_KEY');
+        const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+        const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
         _serviceRoleClient = createClient(url, serviceKey, {
             auth: {
@@ -89,12 +96,11 @@ export function getServiceRoleClient(): SupabaseClient {
 /**
  * Creates a **per-request** anon client that injects a custom header
  * to identify the app user for Supabase RLS policies.
- *
- * Use this when you need fine-grained per-user access control inside agents.
  */
 export function getAnonClientForUser(userId: string): SupabaseClient {
-    const url = requireEnv('NEXT_PUBLIC_SUPABASE_URL');
-    const anonKey = requireEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
+    if (!isConfigured()) return createNoopClient();
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+    const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
     return createClient(url, anonKey, {
         auth: {

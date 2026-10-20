@@ -1,7 +1,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Next.js-16-black?logo=next.js" alt="Next.js" />
   <img src="https://img.shields.io/badge/React-19-61dafb?logo=react" alt="React" />
-  <img src="https://img.shields.io/badge/Supabase-pgvector-3ecf8e?logo=supabase" alt="Supabase" />
   <img src="https://img.shields.io/badge/License-Private-red" alt="License" />
 </p>
 
@@ -39,7 +38,7 @@
 | Frontend | React 19, Tailwind CSS, Framer Motion, Lucide React |
 | State | Zustand |
 | Auth | NextAuth.js (Google & Azure AD OAuth) |
-| Database | Supabase — PostgreSQL + pgvector + RLS |
+| Storage | Direct Gmail API & Client Cache (Zero DB required) |
 | LLM Routing | Groq (Llama 3), OpenRouter (GPT-OSS, Qwen, Nemotron, DeepSeek), Gemini |
 | Local Embeddings | @xenova/transformers (bge-base-en-v1.5, 768-dim) |
 | Email | Gmail API (googleapis) |
@@ -109,28 +108,24 @@ Scasi-AI/
 
 - **Node.js** ≥ 18
 - **npm** (comes with Node)
-- **Supabase** project with pgvector enabled
 - **Google Cloud** project with Gmail API & OAuth enabled
-- **API keys** for Groq, OpenRouter, and/or Gemini
+- **API keys** for Sarvam AI and/or Gemini AI
 
 ### Setup
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/salonxix/Scasi-AI.git
-cd Scasi-AI
+git clone https://github.com/salonxix/scasiaiworks.git
+cd scasiaiworks
 
 # 2. Install dependencies
 npm install
 
 # 3. Configure environment
 cp .env.example .env.local
-# Fill in ALL variables in .env.local (see below)
+# Fill in your Google OAuth & AI keys in .env.local
 
-# 4. Run database migrations
-# Apply the SQL files in supabase/migrations/ to your Supabase project
-
-# 5. Start the dev server
+# 4. Start the dev server
 npm run dev
 ```
 
@@ -142,12 +137,11 @@ All variables are documented in [`.env.example`](.env.example). Key groups:
 
 | Group | Variables | Purpose |
 |-------|-----------|---------|
-| **Supabase** | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Database access |
+| **NextAuth** | `NEXTAUTH_URL`, `NEXTAUTH_SECRET` | Authentication sessions & JWT encryption |
 | **Google OAuth** | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Gmail API & authentication |
-| **Azure AD** | `AZURE_AD_CLIENT_ID`, `AZURE_AD_CLIENT_SECRET`, `AZURE_AD_TENANT_ID` | Enterprise auth |
-| **Groq** | `GROQ_API_KEY` | Llama 3 models (routing, replies) |
-| **OpenRouter** | `OPENROUTER_API_KEY_GPT_OSS`, `OPENROUTER_API_KEY_NEMOTRON`, `OPENROUTER_API_KEY_QWEN3`, `OPENROUTER_API_KEY_HUNTER` | Multi-model access |
-| **Gemini** | `GEMINI_API_KEY` | Embeddings (free tier) |
+| **Sarvam AI** | `SARVAM_API_KEY` | Ultra-fast multilingual AI inference (~300ms) |
+| **Gemini** | `GEMINI_API_KEY` | Google Gemini AI fallback |
+| **Azure AD** | `AZURE_AD_CLIENT_ID`, `AZURE_AD_CLIENT_SECRET`, `AZURE_AD_TENANT_ID` | Enterprise auth (optional) |
 | **Eval Auth** | `EVAL_ADMIN_EMAILS` | Comma-separated admin emails for eval access |
 
 ---
@@ -261,9 +255,11 @@ curl -X POST http://localhost:3000/api/actions/run-evals \
 
 ---
 
-## 📊 Database Schema (Supabase)
+## 📊 Storage Architecture
 
-7 migrations create the following core tables:
+Scasi AI operates seamlessly in standalone mode using Google OAuth & Gmail APIs directly without requiring any external database. 
+
+Optional database schema (if connecting Supabase or PostgreSQL):
 
 | Table | Purpose | Key Columns |
 |-------|---------|-------------|
@@ -276,8 +272,6 @@ curl -X POST http://localhost:3000/api/actions/run-evals \
 | `eval_runs` | Evaluation results | `prompt_version`, `scores`, `dataset_hash` |
 | `eval_prompt_versions` | Prompt snapshots | `version`, `prompt_text`, `timestamp` |
 | `llm_cache` | LLM response cache | `cache_key`, `response`, `model`, `expires_at` |
-
-> Uses **Row Level Security (RLS)**, **pgvector** for similarity search, and **tsvector** triggers for full-text search.
 
 ---
 

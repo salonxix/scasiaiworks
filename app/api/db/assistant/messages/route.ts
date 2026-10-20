@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../../../auth/[...nextauth]/route";
-import { getSupabaseAdmin, ensureUserExists } from "@/lib/supabase";
+import { getSupabaseAdmin, ensureUserExists, isServiceRoleConfigured } from "@/lib/supabase";
 import { getAppUserIdFromSession } from "@/lib/appUser";
 import { ensureUser } from "@/src/agents/rag/repository";
 
@@ -11,6 +11,10 @@ const ALLOWED_ROLES = new Set(["user", "assistant", "system"]);
 export async function GET(req: Request) {
   const session = await getServerSession(authOptions);
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  if (!isServiceRoleConfigured()) {
+    return NextResponse.json({ messages: [] });
+  }
 
   const userId = getAppUserIdFromSession(session);
   const { searchParams } = new URL(req.url);
@@ -46,6 +50,20 @@ export async function POST(req: Request) {
   const session = await getServerSession(authOptions);
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+  const { session_id, role, content } = await req.json();
+
+  if (!isServiceRoleConfigured()) {
+    return NextResponse.json({
+      message: {
+        id: "local-msg-" + Date.now(),
+        session_id: session_id || "local-session",
+        role: role || "user",
+        content: content || "",
+        created_at: new Date().toISOString(),
+      },
+    });
+  }
+
   let userId: string;
   try {
     userId = await ensureUserExists(session);
@@ -55,8 +73,6 @@ export async function POST(req: Request) {
     console.error('[db/assistant/messages] ensureUserExists failed:', message);
     return NextResponse.json({ error: message }, { status: 500 });
   }
-
-  const { session_id, role, content } = await req.json();
 
   if (!session_id || !role || !content) {
     return NextResponse.json({ error: "session_id, role, content required" }, { status: 400 });

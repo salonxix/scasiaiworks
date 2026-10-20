@@ -70,13 +70,14 @@ export const authOptions = {
     async signIn({ user }) {
       if (user?.email) {
         try {
-          const { ensureUserExists } = await import("@/lib/supabase");
-          const userId = await ensureUserExists({ user });
-          // Also ensure via RAG repository client (belt-and-suspenders)
-          const { ensureUser } = await import("@/src/agents/rag/repository");
-          await ensureUser(userId, user.email, user.name, user.image);
+          const { isServiceRoleConfigured, ensureUserExists } = await import("@/lib/supabase");
+          if (isServiceRoleConfigured()) {
+            const userId = await ensureUserExists({ user });
+            const { ensureUser } = await import("@/src/agents/rag/repository");
+            await ensureUser(userId, user.email, user.name, user.image);
+          }
         } catch (err) {
-          console.error("[NextAuth] Auto-provision user failed:", err?.message ?? err);
+          // Non-fatal when external DB is not used
         }
       }
       return true;

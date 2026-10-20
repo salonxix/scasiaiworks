@@ -38,13 +38,27 @@ export function getSupabaseClient(): SupabaseClient | null {
   return _supabase;
 }
 
+function createNoopClient(): SupabaseClient {
+  const handler: ProxyHandler<any> = {
+    get(_target, prop) {
+      if (prop === 'then') {
+        return (resolve: any) => resolve({ data: null, error: null });
+      }
+      return () => new Proxy(() => {}, handler);
+    },
+    apply() {
+      return new Proxy(() => {}, handler);
+    },
+  };
+  return new Proxy(() => {}, handler) as unknown as SupabaseClient;
+}
+
 // Browser-facing client (kept for backward compat — returns a no-op proxy if not configured)
 export const supabase: SupabaseClient = new Proxy({} as SupabaseClient, {
   get(_target, prop) {
     const client = getSupabaseClient();
     if (!client) {
-      // Return a no-op function for any method call so the app doesn't crash
-      return () => Promise.resolve({ data: null, error: new Error('Supabase not configured') });
+      return createNoopClient();
     }
     const value = (client as any)[prop];
     return typeof value === 'function' ? value.bind(client) : value;
@@ -53,7 +67,7 @@ export const supabase: SupabaseClient = new Proxy({} as SupabaseClient, {
 
 export function getSupabaseAdmin(): SupabaseClient {
   if (!isServiceRoleConfigured()) {
-    throw new Error('SUPABASE_SERVICE_ROLE_KEY is not configured. Add it to .env.local.');
+    return createNoopClient();
   }
   if (!_supabaseAdmin) {
     _supabaseAdmin = createClient(
@@ -72,7 +86,7 @@ export function supabaseAdmin(): SupabaseClient {
 
 export function getSupabaseWithUser(userId: string): SupabaseClient {
   if (!isSupabaseConfigured()) {
-    throw new Error('Supabase is not configured.');
+    return createNoopClient();
   }
   return createClient(getEnv('NEXT_PUBLIC_SUPABASE_URL'), getEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY'), {
     auth: { persistSession: false, autoRefreshToken: false },
