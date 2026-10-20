@@ -29,13 +29,13 @@ export const MODELS = {
 
     // ── Sarvam Models (SARVAM_API_KEY) — primary alongside Groq ────────
     SARVAM_2B: {
-        id: 'sarvam-2b-v0.5',
+        id: 'sarvam-105b-conversations',
         provider: 'sarvam' as ModelProvider,
         apiKeyEnv: 'SARVAM_API_KEY',
-        contextWindow: 4096,
+        contextWindow: 32768,
     },
     SARVAM_M: {
-        id: 'sarvam-m',
+        id: 'sarvam-105b-conversations',
         provider: 'sarvam' as ModelProvider,
         apiKeyEnv: 'SARVAM_API_KEY',
         contextWindow: 32768,
@@ -101,6 +101,20 @@ export const MODELS = {
         provider: 'openrouter' as ModelProvider,
         apiKeyEnv: 'OPENROUTER_API_KEY_HUNTER',
         contextWindow: 131072,
+    },
+
+    // ── Generation Models (GEMINI_API_KEY) ─────────────────────────────
+    GEMINI_1_5_FLASH: {
+        id: 'gemini-flash-latest',
+        provider: 'google' as ModelProvider,
+        apiKeyEnv: 'GEMINI_API_KEY',
+        contextWindow: 1048576,
+    },
+    GEMINI_2_0_FLASH: {
+        id: 'gemini-3.8-flash',
+        provider: 'google' as ModelProvider,
+        apiKeyEnv: 'GEMINI_API_KEY',
+        contextWindow: 1048576,
     },
 
     // ── Embedding Model (GEMINI_API_KEY) ────────────────────────────────

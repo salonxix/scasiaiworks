@@ -11,9 +11,9 @@ const cspHeader = [
   `script-src 'self' ${isDev ? "'unsafe-eval' 'unsafe-inline'" : "'unsafe-inline'"} https://fonts.googleapis.com`,
   `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com`,
   `font-src 'self' https://fonts.gstatic.com`,
-  `img-src 'self' data: blob: https://lh3.googleusercontent.com https://avatars.githubusercontent.com`,
+  `img-src 'self' data: blob: https: http: https://*.googleusercontent.com https://avatars.githubusercontent.com`,
   `connect-src 'self' https://api.groq.com https://openrouter.ai https://api.sarvam.ai https://generativelanguage.googleapis.com https://*.supabase.co wss://*.supabase.co`,
-  `frame-src 'none'`,
+  `frame-src 'self' data: blob:`,
   `object-src 'none'`,
   `base-uri 'self'`,
   `form-action 'self'`,
@@ -35,7 +35,7 @@ const nextConfig = {
   },
   images: {
     remotePatterns: [
-      { protocol: 'https', hostname: 'lh3.googleusercontent.com' },
+      { protocol: 'https', hostname: '*.googleusercontent.com' },
       { protocol: 'https', hostname: 'avatars.githubusercontent.com' },
     ],
   },

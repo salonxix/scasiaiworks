@@ -30,42 +30,42 @@ export const taskPolicies: Record<LLMTaskType, TaskModelPolicy> = {
     route: {
         task: 'route',
         primary: MODELS.GROQ_LLAMA_3_1_8B,
-        fallbackChain: [MODELS.GROQ_LLAMA_3_3_70B, MODELS.OR_NEMOTRON_30B, MODELS.OR_HUNTER_ALPHA],
+        fallbackChain: [MODELS.SARVAM_2B, MODELS.GEMINI_1_5_FLASH, MODELS.GROQ_LLAMA_3_3_70B, MODELS.OR_NEMOTRON_30B, MODELS.OR_HUNTER_ALPHA],
     },
     classify: {
         task: 'classify',
         primary: MODELS.GROQ_LLAMA_3_1_8B,
-        fallbackChain: [MODELS.GROQ_LLAMA_3_3_70B, MODELS.OR_NEMOTRON_30B, MODELS.OR_HUNTER_ALPHA],
+        fallbackChain: [MODELS.SARVAM_2B, MODELS.GEMINI_1_5_FLASH, MODELS.GROQ_LLAMA_3_3_70B, MODELS.OR_NEMOTRON_30B, MODELS.OR_HUNTER_ALPHA],
     },
     extract: {
         task: 'extract',
         primary: MODELS.GROQ_LLAMA_3_3_70B,
-        fallbackChain: [MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_GPT_OSS_120B, MODELS.OR_HUNTER_ALPHA],
+        fallbackChain: [MODELS.SARVAM_M, MODELS.GEMINI_1_5_FLASH, MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_GPT_OSS_120B, MODELS.OR_HUNTER_ALPHA],
     },
     summarize: {
         task: 'summarize',
         primary: MODELS.GROQ_LLAMA_3_3_70B,
-        fallbackChain: [MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_GEMINI_FLASH, MODELS.OR_GPT_OSS_120B, MODELS.OR_HUNTER_ALPHA],
+        fallbackChain: [MODELS.SARVAM_M, MODELS.GEMINI_1_5_FLASH, MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_GEMINI_FLASH, MODELS.OR_GPT_OSS_120B, MODELS.OR_HUNTER_ALPHA],
     },
     reply: {
         task: 'reply',
         primary: MODELS.GROQ_LLAMA_3_3_70B,
-        fallbackChain: [MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_GPT_OSS_120B, MODELS.OR_HUNTER_ALPHA],
+        fallbackChain: [MODELS.SARVAM_M, MODELS.GEMINI_1_5_FLASH, MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_GPT_OSS_120B, MODELS.OR_HUNTER_ALPHA],
     },
     rerank: {
         task: 'rerank',
         primary: MODELS.GROQ_LLAMA_3_3_70B,
-        fallbackChain: [MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_QWEN_32B, MODELS.OR_HUNTER_ALPHA],
+        fallbackChain: [MODELS.SARVAM_M, MODELS.GEMINI_1_5_FLASH, MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_QWEN_32B, MODELS.OR_HUNTER_ALPHA],
     },
     judge: {
         task: 'judge',
         primary: MODELS.GROQ_LLAMA_3_3_70B,
-        fallbackChain: [MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_QWEN3_VL_235B, MODELS.OR_HUNTER_ALPHA],
+        fallbackChain: [MODELS.SARVAM_M, MODELS.GEMINI_1_5_FLASH, MODELS.GROQ_LLAMA_3_1_8B, MODELS.OR_QWEN3_VL_235B, MODELS.OR_HUNTER_ALPHA],
     },
     embed: {
         task: 'embed',
         primary: MODELS.LOCAL_EMBED,
-        fallbackChain: [],
+        fallbackChain: [MODELS.GEMINI_EMBED_001],
     },
 };
 

@@ -1,4 +1,4 @@
-﻿import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import type { Session } from 'next-auth';
 import { getAppUserIdFromSession } from './appUser';
 
@@ -10,13 +10,13 @@ function getEnv(name: string): string {
   return process.env[name] || '';
 }
 
-function isSupabaseConfigured(): boolean {
+export function isSupabaseConfigured(): boolean {
   const url = getEnv('NEXT_PUBLIC_SUPABASE_URL');
   const key = getEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
   return !!(url && !url.startsWith('your_') && key && !key.startsWith('your_'));
 }
 
-function isServiceRoleConfigured(): boolean {
+export function isServiceRoleConfigured(): boolean {
   const key = getEnv('SUPABASE_SERVICE_ROLE_KEY');
   return !!(key && !key.startsWith('your_'));
 }

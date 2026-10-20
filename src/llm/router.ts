@@ -1,4 +1,4 @@
-﻿import { Groq } from 'groq-sdk';
+import { Groq } from 'groq-sdk';
 import { LLMTaskType, ModelConfig, GenerationOptions, GenerationResult, EmbedOptions, EmbedResult } from './types';
 import { taskPolicies } from './policy';
 import { rateLimiter } from './rate-limiter';
@@ -174,6 +174,7 @@ export class LLMRouter {
                             max_tokens: options.maxTokens,
                         };
 
+                        const callSignal = options.signal || (typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined);
                         const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
                             method: 'POST',
                             headers: {
@@ -183,7 +184,7 @@ export class LLMRouter {
                                 'X-Title': 'Scasi-AI'
                             },
                             body: JSON.stringify(body),
-                            signal: options.signal,
+                            signal: callSignal,
                         });
 
                         if (!resp.ok) {
@@ -211,6 +212,7 @@ export class LLMRouter {
                             max_tokens: options.maxTokens,
                         };
 
+                        const callSignal = options.signal || (typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined);
                         const resp = await fetch('https://api.sarvam.ai/v1/chat/completions', {
                             method: 'POST',
                             headers: {
@@ -218,7 +220,7 @@ export class LLMRouter {
                                 'api-subscription-key': apiKey,
                             },
                             body: JSON.stringify(body),
-                            signal: options.signal,
+                            signal: callSignal,
                         });
 
                         if (!resp.ok) {
@@ -233,6 +235,51 @@ export class LLMRouter {
                             promptTokens: rawUsage.prompt_tokens,
                             completionTokens: rawUsage.completion_tokens,
                             totalTokens: rawUsage.total_tokens
+                        };
+                    } else if (model.provider === 'google') {
+                        const apiKey = this.getApiKey(model);
+                        const body: Record<string, unknown> = {
+                            contents: [
+                                {
+                                    parts: [{ text: fullPrompt }],
+                                },
+                            ],
+                            generationConfig: {
+                                temperature: options.temperature ?? 0.7,
+                                maxOutputTokens: options.maxTokens,
+                                responseMimeType: schema ? 'application/json' : 'text/plain',
+                            },
+                        };
+
+                        if (options.systemPrompt) {
+                            body.systemInstruction = {
+                                parts: [{ text: options.systemPrompt }],
+                            };
+                        }
+
+                        const callSignal = options.signal || (typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(10000) : undefined);
+                        const resp = await fetch(
+                            `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent?key=${apiKey}`,
+                            {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(body),
+                                signal: callSignal,
+                            }
+                        );
+
+                        if (!resp.ok) {
+                            const errBody = await resp.text();
+                            throw new Error(`Gemini Error: ${resp.status} ${errBody}`);
+                        }
+
+                        const data = await resp.json();
+                        resultText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                        const meta = data.usageMetadata || {};
+                        usage = {
+                            promptTokens: meta.promptTokenCount || 0,
+                            completionTokens: meta.candidatesTokenCount || 0,
+                            totalTokens: meta.totalTokenCount || 0,
                         };
                     }
 
@@ -485,6 +532,71 @@ export class LLMRouter {
                         try {
                             const data = JSON.parse(dataStr);
                             const content = data.choices[0]?.delta?.content || '';
+                            if (content) { onToken(content); yield content; }
+                        } catch {
+                            // Incomplete SSE chunk, skip
+                        }
+                    }
+                }
+            }
+        } else if (model.provider === 'google') {
+            const apiKey = this.getApiKey(model);
+            const body: Record<string, unknown> = {
+                contents: [
+                    {
+                        parts: [{ text: prompt }],
+                    },
+                ],
+                generationConfig: {
+                    temperature: options.temperature ?? 0.7,
+                    maxOutputTokens: options.maxTokens,
+                },
+            };
+
+            if (options.systemPrompt) {
+                body.systemInstruction = {
+                    parts: [{ text: options.systemPrompt }],
+                };
+            }
+
+            const resp = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:streamGenerateContent?alt=sse&key=${apiKey}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                    signal,
+                }
+            );
+
+            if (!resp.ok) throw new Error(`Gemini Stream Error: ${resp.status}`);
+            if (!resp.body) throw new Error('No body returned from Gemini streaming API');
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = '';
+
+            while (true) {
+                if (signal?.aborted) {
+                    await reader.cancel().catch(() => {});
+                    throw createAbortError('Aborted during Gemini stream');
+                }
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                let boundary = buffer.indexOf('\n');
+
+                while (boundary !== -1) {
+                    const line = buffer.slice(0, boundary).trim();
+                    buffer = buffer.slice(boundary + 1);
+                    boundary = buffer.indexOf('\n');
+
+                    if (line.startsWith('data: ')) {
+                        const dataStr = line.slice(6).trim();
+                        try {
+                            const data = JSON.parse(dataStr);
+                            const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
                             if (content) { onToken(content); yield content; }
                         } catch {
                             // Incomplete SSE chunk, skip

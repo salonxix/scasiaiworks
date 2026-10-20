@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../../auth/[...nextauth]/route";
-import { getSupabaseAdmin, ensureUserExists } from "@/lib/supabase";
+import { getSupabaseAdmin, ensureUserExists, isServiceRoleConfigured } from "@/lib/supabase";
 import { getAppUserIdFromSession } from "@/lib/appUser";
 import { ensureUser } from "@/src/agents/rag/repository";
 import { safeISODate } from "@/lib/dateUtils";
@@ -20,6 +20,10 @@ export async function GET() {
   const session = await getServerSession(authOptions);
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+  if (!isServiceRoleConfigured()) {
+    return NextResponse.json({ emails: [] });
+  }
+
   const userId = getAppUserIdFromSession(session);
   const supabaseAdmin = getSupabaseAdmin();
 
@@ -37,6 +41,10 @@ export async function GET() {
 export async function POST(req: Request) {
   const session = await getServerSession(authOptions);
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  if (!isServiceRoleConfigured()) {
+    return NextResponse.json({ inserted: 0, message: "Supabase not configured, skipping sync" });
+  }
 
   let userId: string;
   try {

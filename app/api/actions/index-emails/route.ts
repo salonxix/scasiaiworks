@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../../auth/[...nextauth]/route';
 import { google } from 'googleapis';
-import { ensureUserExists } from '@/lib/supabase';
+import { ensureUserExists, isServiceRoleConfigured } from '@/lib/supabase';
 import { ragAgent } from '@/src/agents/rag';
 import { ensureUser } from '@/src/agents/rag/repository';
 import { pMap } from '@/src/agents/_shared/utils';
@@ -47,6 +47,10 @@ export async function POST(req: Request) {
     const session = await getServerSession(authOptions);
     if (!session || !session.accessToken) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    if (!isServiceRoleConfigured()) {
+        return NextResponse.json({ indexed: 0, message: 'Supabase not configured, skipping vector indexing' });
     }
 
     let userId: string;
