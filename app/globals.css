@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+:root {
+  --font-dm-sans: 'DM Sans', sans-serif;
+  --font-syne: 'Syne', sans-serif;
+}
+
 /* ===============================
    Global Reset
 ================================ */
